@@ -537,9 +537,29 @@ async function init() {
   const roomH = 4.8;
   const roomD = 12.0;
 
+  const roomWallDark = new THREE.MeshStandardMaterial({
+    color: 0x1f1f24,
+    roughness: 0.95,
+    metalness: 0.0,
+    side: THREE.BackSide,
+  });
+  const roomWallOrange = new THREE.MeshStandardMaterial({
+    color: 0xffa500, // bright orange
+    roughness: 0.9,
+    metalness: 0.02,
+    side: THREE.BackSide,
+  });
+  const roomWallGray = new THREE.MeshStandardMaterial({
+    color: 0x7a7a7a,
+    roughness: 0.95,
+    metalness: 0.0,
+    side: THREE.BackSide,
+  });
+
   const room = new THREE.Mesh(
     new THREE.BoxGeometry(roomW, roomH, roomD),
-    new THREE.MeshStandardMaterial({ color: 0x1f1f24, roughness: 0.95, metalness: 0.0, side: THREE.BackSide })
+    // BoxGeometry material order: +x, -x, +y, -y, +z, -z
+    [roomWallOrange, roomWallOrange, roomWallGray, roomWallGray, roomWallDark, roomWallDark]
   );
   room.position.set(0, roomH / 2, 0);
   scene.add(room);
@@ -547,7 +567,7 @@ async function init() {
   // floor accent
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(roomW, roomD),
-    new THREE.MeshStandardMaterial({ color: 0x101012, roughness: 1.0, metalness: 0.0 })
+    new THREE.MeshStandardMaterial({ color: 0x6f6f6f, roughness: 1.0, metalness: 0.0 })
   );
   floor.rotation.x = -Math.PI / 2;
   floor.position.set(0, 0.001, 0);
