@@ -98,12 +98,42 @@ let faceLastMs = 0;
 let faceInFlight = false;
 let faceCanvas = null;
 let faceCtx = null;
+let faceLastSize = { w: 0, h: 0 };
+let faceLastOkMs = 0;
+let faceLoggedFirstOk = false;
+let faceLastNoFaceLogMs = 0;
+let faceFallbackDetector = null; // tfjs fallback (e.g., blazeface)
+let faceFallbackLoading = false;
+let faceFallbackLogged = false;
 
 const FACE_SAMPLE_INTERVAL_MS = 80; // 10〜15fps 程度
 const WEBCAM_DIAGONAL_FOV_RAD = Math.PI / 3; // ざっくり60deg（参考zipのtrompeloeilと同系統）
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = Array.from(document.scripts).find((s) => s.src === src);
+    if (existing) {
+      if (existing.dataset.loaded === "1") return resolve(true);
+      existing.addEventListener("load", () => resolve(true), { once: true });
+      existing.addEventListener("error", (e) => reject(e), { once: true });
+      return;
+    }
+
+    const s = document.createElement("script");
+    s.src = src;
+    s.defer = true;
+    s.dataset.loaded = "0";
+    s.onload = () => {
+      s.dataset.loaded = "1";
+      resolve(true);
+    };
+    s.onerror = (e) => reject(e);
+    document.head.appendChild(s);
+  });
 }
 
 function fovFromDiagonal(dfov, w, h) {
@@ -113,6 +143,29 @@ function fovFromDiagonal(dfov, w, h) {
     hfov: 2 * Math.atan((w * t) / hyp),
     vfov: 2 * Math.atan((h * t) / hyp),
   };
+}
+
+function waitForVideoReady(videoEl, { timeoutMs = 3000 } = {}) {
+  // videoWidth/videoHeight が 0 のままだと detector が常に空振りするケースがある
+  if ((videoEl.videoWidth || 0) > 0 && (videoEl.videoHeight || 0) > 0) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(ok);
+    };
+    const onMeta = () => finish(true);
+    const onCanPlay = () => finish(true);
+    const cleanup = () => {
+      videoEl.removeEventListener("loadedmetadata", onMeta);
+      videoEl.removeEventListener("canplay", onCanPlay);
+    };
+    videoEl.addEventListener("loadedmetadata", onMeta, { once: true });
+    videoEl.addEventListener("canplay", onCanPlay, { once: true });
+    setTimeout(() => finish(false), timeoutMs);
+  });
 }
 
 async function waitForGlobals({ timeoutMs = 8000 } = {}) {
@@ -139,11 +192,13 @@ async function initFaceTracking(webcamEl) {
     try {
       await webcamEl.play();
     } catch {}
+    await waitForVideoReady(webcamEl, { timeoutMs: 4000 });
     faceVideo = webcamEl;
 
     const vw = webcamEl.videoWidth || stream.getVideoTracks?.()?.[0]?.getSettings?.()?.width || 640;
     const vh = webcamEl.videoHeight || stream.getVideoTracks?.()?.[0]?.getSettings?.()?.height || 480;
     faceFov = fovFromDiagonal(WEBCAM_DIAGONAL_FOV_RAD, vw, vh);
+    faceLastSize = { w: vw, h: vh };
 
     // 1) Native FaceDetector (best-effort)
     if ("FaceDetector" in window) {
@@ -225,11 +280,54 @@ async function initFaceTracking(webcamEl) {
   }
 }
 
+async function ensureFaceFallbackTfjs() {
+  if (faceFallbackDetector || faceFallbackLoading) return;
+  if (!window.tf) return;
+  faceFallbackLoading = true;
+  try {
+    // FaceMesh が取れない環境向けの最小フォールバック（軽量なbbox検出）
+    await loadScriptOnce("https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js");
+    const blaze = window.blazeface;
+    if (!blaze?.load) throw new Error("blazeface global not available after script load");
+    // blazeface は tfjs backend をそのまま使える
+    faceFallbackDetector = await blaze.load();
+    if (!faceFallbackLogged) {
+      faceFallbackLogged = true;
+      console.info("[room] Face tracking fallback enabled (blazeface)");
+    }
+  } catch (e) {
+    console.warn("[room] Failed to load face fallback (blazeface):", e);
+  } finally {
+    faceFallbackLoading = false;
+  }
+}
+
 async function sampleFaceBox() {
-  if (!faceDetector || !faceVideo || faceVideo.readyState < 2) return null;
+  if (!faceDetector || !faceVideo) return null;
 
   const vw = faceVideo.videoWidth || 640;
   const vh = faceVideo.videoHeight || 480;
+  if (vw !== faceLastSize.w || vh !== faceLastSize.h || !faceFov) {
+    faceFov = fovFromDiagonal(WEBCAM_DIAGONAL_FOV_RAD, vw, vh);
+    faceLastSize = { w: vw, h: vh };
+  }
+
+  if (faceVideo.readyState < 2) return null;
+
+  const asXY = (p) => {
+    if (!p) return null;
+    if (Array.isArray(p)) return { x: Number(p[0]), y: Number(p[1]) };
+    if (typeof p === "object") return { x: Number(p.x), y: Number(p.y) };
+    return null;
+  };
+
+  const normalizeIfNeeded = (n, scale) => {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return NaN;
+    // 0..1（または-0.5..1.5程度）で返ってくる実装があるため、ざっくりで判定して px へ寄せる
+    if (Math.abs(v) <= 2 && scale > 2) return v * scale;
+    return v;
+  };
 
   if (faceTrackerKind === "native") {
     const faces = await faceDetector.detect(faceVideo);
@@ -265,7 +363,31 @@ async function sampleFaceBox() {
       return null;
     }
   }
-  if (!faces?.length) return null;
+  if (!faces?.length) {
+    // FaceMesh が取れない場合の保険：一定時間ヒットしないなら bbox 検出へ切替
+    const now = performance.now();
+    if (now - faceLastOkMs > 2500) ensureFaceFallbackTfjs().catch(() => {});
+    if (faceFallbackDetector?.estimateFaces) {
+      try {
+        // blazeface: estimateFaces(input, returnTensors, flipHorizontal, annotateBoxes)
+        const preds = await faceFallbackDetector.estimateFaces(faceVideo, false, false, false);
+        if (preds?.length) {
+          const p = preds[0];
+          const tl = asXY(p.topLeft);
+          const br = asXY(p.bottomRight);
+          if (tl && br) {
+            const cx = (tl.x + br.x) * 0.5;
+            const cy = (tl.y + br.y) * 0.5;
+            const w = Math.max(1, br.x - tl.x);
+            if (Number.isFinite(cx) && Number.isFinite(cy) && Number.isFinite(w)) return { cx, cy, w, vw, vh };
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  }
 
   const f = faces[0];
 
@@ -278,12 +400,14 @@ async function sampleFaceBox() {
     yMin = box.yMin ?? box.top ?? 0;
     yMax = box.yMax ?? (box.top ?? 0) + (box.height ?? 0);
   } else if (f.boundingBox?.topLeft && f.boundingBox?.bottomRight) {
-    const [x1, y1] = f.boundingBox.topLeft;
-    const [x2, y2] = f.boundingBox.bottomRight;
-    xMin = x1;
-    yMin = y1;
-    xMax = x2;
-    yMax = y2;
+    const p1 = asXY(f.boundingBox.topLeft);
+    const p2 = asXY(f.boundingBox.bottomRight);
+    if (p1 && p2) {
+      xMin = p1.x;
+      yMin = p1.y;
+      xMax = p2.x;
+      yMax = p2.y;
+    }
   } else if (f.boundingBox) {
     const bb = f.boundingBox;
     xMin = bb.xMin ?? bb.left ?? 0;
@@ -291,12 +415,42 @@ async function sampleFaceBox() {
     xMax = bb.xMax ?? (bb.left ?? 0) + (bb.width ?? 0);
     yMax = bb.yMax ?? (bb.top ?? 0) + (bb.height ?? 0);
   } else {
-    return null;
+    // 最終手段：keypoints から bbox を作る
+    const kps = f.keypoints || f.scaledMesh || f.mesh || null;
+    const arr = Array.isArray(kps) ? kps : null;
+    if (!arr?.length) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const kp of arr) {
+      const p = asXY(kp);
+      if (!p) continue;
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY))
+      return null;
+    xMin = minX;
+    yMin = minY;
+    xMax = maxX;
+    yMax = maxY;
   }
+
+  xMin = normalizeIfNeeded(xMin, vw);
+  xMax = normalizeIfNeeded(xMax, vw);
+  yMin = normalizeIfNeeded(yMin, vh);
+  yMax = normalizeIfNeeded(yMax, vh);
+
+  if (![xMin, xMax, yMin, yMax].every((v) => Number.isFinite(v))) return null;
 
   const cx = (xMin + xMax) * 0.5;
   const cy = (yMin + yMax) * 0.5;
   const w = Math.max(1, xMax - xMin);
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(w)) return null;
   return { cx, cy, w, vw, vh };
 }
 
@@ -533,7 +687,21 @@ async function init() {
 
     try {
       const sample = await sampleFaceBox();
-      if (!sample) return;
+      if (!sample) {
+        if (faceTrackerKind === "tfjs" && now - faceLastOkMs > 5000 && now - faceLastNoFaceLogMs > 5000) {
+          faceLastNoFaceLogMs = now;
+          console.warn(
+            "[room] Face tracking active (tfjs) but no face detected. Check lighting, camera framing, and DevTools Network for model download errors."
+          );
+        }
+        return;
+      }
+
+      faceLastOkMs = now;
+      if (!faceLoggedFirstOk) {
+        faceLoggedFirstOk = true;
+        console.info("[room] Face detected; motion parallax should respond to head movement.");
+      }
 
       const { cx, cy, w, vw, vh } = sample;
 
