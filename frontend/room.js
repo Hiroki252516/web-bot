@@ -488,6 +488,7 @@ async function init() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.domElement.style.position = "absolute";
   renderer.domElement.style.inset = "0";
+  renderer.domElement.style.zIndex = "0";
   // UI操作を優先（必要なら後で切替）
   renderer.domElement.style.pointerEvents = "none";
   stage.appendChild(renderer.domElement);
@@ -498,17 +499,37 @@ async function init() {
   cssRenderer.setSize(window.innerWidth, window.innerHeight);
   cssRenderer.domElement.style.position = "absolute";
   cssRenderer.domElement.style.inset = "0";
+  cssRenderer.domElement.style.zIndex = "1";
   // CSS3DRenderer 自体はポインターを奪わず、オブジェクト要素だけ pointerEvents:auto
   cssRenderer.domElement.style.pointerEvents = "none";
   stage.appendChild(cssRenderer.domElement);
 
+  // --- WebGL overlay (avatar only) ---
+  // CSS3D(DOM) はブラウザの重なり順の都合で WebGL より上に描画されます。
+  // 「アバターがUIより手前」を成立させるため、アバターだけを透明キャンバスで上描きします。
+  const avatarRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  avatarRenderer.setSize(window.innerWidth, window.innerHeight);
+  avatarRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  avatarRenderer.setClearColor(0x000000, 0);
+  avatarRenderer.domElement.style.position = "absolute";
+  avatarRenderer.domElement.style.inset = "0";
+  avatarRenderer.domElement.style.zIndex = "2";
+  avatarRenderer.domElement.style.pointerEvents = "none";
+  stage.appendChild(avatarRenderer.domElement);
+
   // --- Lights ---
-  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+  // レイヤー分割レンダリング（背景=0 / アバター=1）でも照明が効くように両方へ
+  ambient.layers.enable(1);
+  scene.add(ambient);
+
   const key = new THREE.DirectionalLight(0xffffff, 0.9);
   key.position.set(3.5, 4.5, 2.5);
+  key.layers.enable(1);
   scene.add(key);
   const rim = new THREE.DirectionalLight(0x88aaff, 0.35);
   rim.position.set(-4, 2.5, -3);
+  rim.layers.enable(1);
   scene.add(rim);
 
   // --- Room geometry ---
@@ -546,6 +567,8 @@ async function init() {
 
   // --- UI as CSS3DObject (back wall) ---
   const uiObj = new CSS3DObject(uiDiv);
+  // cssRenderer.domElement は pointer-events:none のため、UI本体は明示的に有効化
+  uiDiv.style.pointerEvents = "auto";
   uiObj.position.set(0, roomH * 0.56, backZ);
   uiObj.rotation.y = 0; // 反転させると見えなくなることが多いのでまずは0
   cssScene.add(uiObj);
@@ -574,6 +597,11 @@ async function init() {
   // --- Avatar (VRM) ---
   const avatarGroup = new THREE.Group();
   scene.add(avatarGroup);
+  const setLayerRecursive = (root, layer) => {
+    root.traverse((o) => o.layers.set(layer));
+  };
+  // アバターは前面キャンバスで描画するため layer=1 へ
+  avatarGroup.layers.set(1);
 
   // まずは必ず見えるダミーを置く（VRMロード失敗でも「3Dが動いてる」ことが分かる）
   const dummy = new THREE.Mesh(
@@ -582,6 +610,7 @@ async function init() {
   );
   dummy.position.set(0, 0.7, 2.8);
   avatarGroup.add(dummy);
+  setLayerRecursive(dummy, 1);
 
   let vrm = null;
   const _tmpPos = new THREE.Vector3();
@@ -618,6 +647,7 @@ async function init() {
     vrm.scene.scale.setScalar(1.0);
 
     avatarGroup.add(vrm.scene);
+    setLayerRecursive(vrm.scene, 1);
 
     console.info("[room] VRM loaded:", AVATAR_URL);
   } catch (e) {
@@ -740,8 +770,8 @@ async function init() {
     }
   }
 
-  function animate() {
-    requestAnimationFrame(animate);
+	  function animate() {
+	    requestAnimationFrame(animate);
 
     const dt = clock.getDelta();
     const t = clock.elapsedTime;
@@ -762,14 +792,34 @@ async function init() {
     // アバターをこちらへ向ける（視点移動時も追従）
     updateAvatarFacing();
 
+    // 背景（部屋）: layer=0
+    camera.layers.set(0);
     renderer.render(scene, camera);
-    cssRenderer.render(cssScene, camera);
-  }
+
+	    // UI（DOM/CSS3D）: layer=0
+	    cssRenderer.render(cssScene, camera);
+
+	    // 前景（アバター）: layer=1 を透明キャンバスで上描き
+	    // NOTE: overlay renderer で同じ scene を render すると scene.background が「不透明に」クリアされ、
+	    // 下の WebGL(部屋) / CSS3D(UI) を覆ってしまう。ここでは overlay パスだけ background を無効化して透明に保つ。
+	    const _bg = scene.background;
+	    scene.background = null;
+	    try {
+	      camera.layers.set(1);
+	      avatarRenderer.render(scene, camera);
+	    } finally {
+	      scene.background = _bg;
+	    }
+
+	    // 次フレームへ戻す
+	    camera.layers.set(0);
+	  }
 
   function onResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    avatarRenderer.setSize(window.innerWidth, window.innerHeight);
     cssRenderer.setSize(window.innerWidth, window.innerHeight);
     fitUI();
   }
