@@ -1,440 +1,627 @@
+// frontend/room.js（修正版）
+// 目的：
+// - Three.js で「3Dの部屋」を描画（WebGL）
+// - 従来UI(#ui3d)を CSS3DRenderer で「奥の壁一面」に貼る
+// - 手前に VRM(ずんだもん) を配置（無ければダミー）
+// - busイベント（assistant/user）に連動して身振り手振り
+// - Webカメラ + 顔検出（任意）でモーションパララックス（擬似3D）
+
 import * as THREE from "three";
 import { CSS3DRenderer, CSS3DObject } from "three/examples/jsm/renderers/CSS3DRenderer.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
+// three-vrm（three@0.160付近で安定しやすい v2 系）
+import { VRMLoaderPlugin, VRMUtils } from "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.1.0/lib/three-vrm.module.js";
+
 import { on } from "./bus.js";
 
-const ROOM = { w: 10, h: 6, d: 14 };
-const AVATAR_URL = "./assets/zundamon.vrm";
+const AVATAR_URL = "./assets/zundamon.vrm"; // ここに配置したVRMを読みます
 
-const state = {
-  assistantSpeaking: false,
-  micRms: 0,
-  micRmsSmoothed: 0,
-};
+// アバターが常にこちら（カメラ）を向くようにするか。
+// ※「固定向きが良い」なら false にしてください。
+const AVATAR_FACE_VIEWER = true;
 
-function clamp(v, min, max) {
-  return Math.min(max, Math.max(min, v));
+// モデルの「正面」が +Z ではなく -Z の場合は Math.PI にすると合うことが多いです。
+const AVATAR_YAW_OFFSET = 0;
+
+// --- ちょっとしたデバッグ表示（致命的エラー時のみ） ---
+const debug = (() => {
+  const el = document.createElement("pre");
+  el.style.cssText = [
+    "position:fixed",
+    "left:12px",
+    "bottom:12px",
+    "max-width: min(720px, 96vw)",
+    "max-height: 40vh",
+    "overflow:auto",
+    "padding:10px 12px",
+    "border-radius:10px",
+    "background: rgba(0,0,0,0.75)",
+    "color:#fff",
+    "font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+    "z-index:999999",
+    "display:none",
+  ].join(";");
+  document.body.appendChild(el);
+  return {
+    show(msg) {
+      el.textContent = String(msg);
+      el.style.display = "block";
+    },
+    append(msg) {
+      el.textContent += `\n${msg}`;
+      el.style.display = "block";
+    },
+    hide() {
+      el.style.display = "none";
+    },
+  };
+})();
+
+function requireEl(id) {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`Missing element: #${id} (index.html を確認してください)`);
+  return el;
 }
 
-function safeLog(...args) {
-  // eslint-disable-next-line no-console
-  console.log("[room]", ...args);
+function lerpAngle(a, b, t) {
+  // shortest-path lerp for radians
+  const TWO_PI = Math.PI * 2;
+  let d = (b - a) % TWO_PI;
+  if (d < -Math.PI) d += TWO_PI;
+  else if (d > Math.PI) d -= TWO_PI;
+  return a + d * t;
 }
 
-init().catch((e) => safeLog("init failed:", e));
+// 状態（busイベント）
+let assistantSpeaking = false;
+let micRms = 0;
 
+on("assistant:speakingStart", () => (assistantSpeaking = true));
+on("assistant:speakingEnd", () => (assistantSpeaking = false));
+on("user:micRms", (e) => {
+  const v = Number(e?.detail?.rms ?? 0);
+  // ちょい平滑化（ガタつき防止）
+  micRms = micRms * 0.85 + v * 0.15;
+});
+
+// 顔トラッキング（任意）
+// 目的：
+// - なるべく「動かない」原因を潰すため、複数の実装をフォールバックする
+//   1) ブラウザ内蔵 FaceDetector（対応ブラウザなら最優先・追加DL不要）
+//   2) tfjs + face-landmarks-detection（既存の設計）
+let faceTrackerKind = "none"; // "none" | "native" | "tfjs"
+let faceDetector = null; // FaceDetector or tfjs detector
+let faceVideo = null;
+let faceFov = null; // { hfov, vfov }
+let faceLastMs = 0;
+let faceInFlight = false;
+let faceCanvas = null;
+let faceCtx = null;
+
+const FACE_SAMPLE_INTERVAL_MS = 80; // 10〜15fps 程度
+const WEBCAM_DIAGONAL_FOV_RAD = Math.PI / 3; // ざっくり60deg（参考zipのtrompeloeilと同系統）
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function fovFromDiagonal(dfov, w, h) {
+  const hyp = Math.sqrt(w * w + h * h);
+  const t = Math.tan(dfov / 2);
+  return {
+    hfov: 2 * Math.atan((w * t) / hyp),
+    vfov: 2 * Math.atan((h * t) / hyp),
+  };
+}
+
+async function waitForGlobals({ timeoutMs = 8000 } = {}) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    if (window.tf && window.faceLandmarksDetection) return true;
+    await sleep(50);
+  }
+  return false;
+}
+
+async function initFaceTracking(webcamEl) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    console.info("[room] Face tracking disabled (getUserMedia not supported)");
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+      audio: false,
+    });
+    webcamEl.srcObject = stream;
+    try {
+      await webcamEl.play();
+    } catch {}
+    faceVideo = webcamEl;
+
+    const vw = webcamEl.videoWidth || stream.getVideoTracks?.()?.[0]?.getSettings?.()?.width || 640;
+    const vh = webcamEl.videoHeight || stream.getVideoTracks?.()?.[0]?.getSettings?.()?.height || 480;
+    faceFov = fovFromDiagonal(WEBCAM_DIAGONAL_FOV_RAD, vw, vh);
+
+    // 1) Native FaceDetector (best-effort)
+    if ("FaceDetector" in window) {
+      try {
+        faceDetector = new window.FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
+        faceTrackerKind = "native";
+        console.info("[room] Face tracking enabled (native FaceDetector)");
+        return;
+      } catch (e) {
+        console.info("[room] Native FaceDetector unavailable:", e);
+      }
+    }
+
+    // 2) tfjs fallback
+    if (!window.tf || !window.faceLandmarksDetection) {
+      await waitForGlobals({ timeoutMs: 8000 });
+    }
+
+    const tf = window.tf;
+    let fld = window.faceLandmarksDetection;
+
+    if (!tf) {
+      console.info("[room] Face tracking disabled (tfjs not loaded)");
+      debug.append(
+        "Face tracking: OFF (tfjs not loaded)\n" +
+          "※Webカメラのパララックスを使うには、ブラウザのコンソール/Networkで tfjs の読み込みエラーが無いか確認してください。"
+      );
+      return;
+    }
+
+    if (!fld?.createDetector && !fld?.load) {
+      try {
+        // UMDが読み込めていない環境向けの保険（CDNのESMビルド）
+        fld = await import(
+          "https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.5/dist/face-landmarks-detection.esm.js"
+        );
+        window.faceLandmarksDetection = fld;
+      } catch (e) {
+        console.info("[room] Face tracking disabled (face-landmarks-detection not loaded)");
+        debug.append(
+          "Face tracking: OFF (face-landmarks-detection not loaded)\n" +
+            "※index.html の CDN スクリプト読み込みを確認してください。"
+        );
+        return;
+      }
+    }
+
+    // できるだけ滑らかにするため WebGL backend を優先（失敗してもデフォルトで続行）
+    try {
+      await tf.setBackend("webgl");
+    } catch {}
+    await tf.ready();
+
+    // v1系: createDetector / 旧API: load
+    if (fld.createDetector) {
+      const model = fld.SupportedModels?.MediaPipeFaceMesh ?? fld.SupportedModels?.MediaPipeFaceMesh;
+      faceDetector = await fld.createDetector(model, {
+        runtime: "tfjs",
+        refineLandmarks: false,
+        maxFaces: 1,
+      });
+    } else {
+      // older API shape (参考zipと同じ系)
+      faceDetector = await fld.load(fld.SupportedPackages?.mediapipeFacemesh, {
+        maxFaces: 1,
+        shouldLoadIrisModel: false,
+      });
+    }
+
+    faceTrackerKind = "tfjs";
+    console.info("[room] Face tracking enabled (tfjs)");
+  } catch (e) {
+    console.warn("[room] Face tracking init failed:", e);
+    debug.append(
+      "Face tracking: OFF (camera permission denied or init failed)\n" +
+        "※ブラウザのサイト設定でカメラ許可をONにするとモーションパララックスが有効になります。\n" +
+        String(e)
+    );
+  }
+}
+
+async function sampleFaceBox() {
+  if (!faceDetector || !faceVideo || faceVideo.readyState < 2) return null;
+
+  const vw = faceVideo.videoWidth || 640;
+  const vh = faceVideo.videoHeight || 480;
+
+  if (faceTrackerKind === "native") {
+    const faces = await faceDetector.detect(faceVideo);
+    if (!faces?.length) return null;
+    const bb = faces[0].boundingBox;
+    if (!bb) return null;
+    const cx = bb.x + bb.width * 0.5;
+    const cy = bb.y + bb.height * 0.5;
+    const w = Math.max(1, bb.width);
+    return { cx, cy, w, vw, vh };
+  }
+
+  // tfjs path: face-landmarks-detection (various versions return slightly different shapes)
+  const estimateFaces = faceDetector.estimateFaces?.bind(faceDetector) || null;
+  if (!estimateFaces) return null;
+
+  // trompeloeil と同じく flipHorizontal:false（カメラ視点のまま）
+  let faces = null;
+  try {
+    faces = await estimateFaces(faceVideo, { flipHorizontal: false });
+  } catch {
+    // legacy API: estimateFaces({input: ImageData, flipHorizontal, predictIrises})
+    try {
+      faceCanvas ||= document.createElement("canvas");
+      faceCtx ||= faceCanvas.getContext("2d", { willReadFrequently: true });
+      if (!faceCtx) return null;
+      faceCanvas.width = vw;
+      faceCanvas.height = vh;
+      faceCtx.drawImage(faceVideo, 0, 0, vw, vh);
+      const img = faceCtx.getImageData(0, 0, vw, vh);
+      faces = await estimateFaces({ input: img, flipHorizontal: false, predictIrises: false });
+    } catch {
+      return null;
+    }
+  }
+  if (!faces?.length) return null;
+
+  const f = faces[0];
+
+  // new API: { box: {xMin,xMax,yMin,yMax} } / legacy: { boundingBox: { topLeft, bottomRight } }
+  let xMin, xMax, yMin, yMax;
+  if (f.box) {
+    const box = f.box;
+    xMin = box.xMin ?? box.left ?? 0;
+    xMax = box.xMax ?? (box.left ?? 0) + (box.width ?? 0);
+    yMin = box.yMin ?? box.top ?? 0;
+    yMax = box.yMax ?? (box.top ?? 0) + (box.height ?? 0);
+  } else if (f.boundingBox?.topLeft && f.boundingBox?.bottomRight) {
+    const [x1, y1] = f.boundingBox.topLeft;
+    const [x2, y2] = f.boundingBox.bottomRight;
+    xMin = x1;
+    yMin = y1;
+    xMax = x2;
+    yMax = y2;
+  } else if (f.boundingBox) {
+    const bb = f.boundingBox;
+    xMin = bb.xMin ?? bb.left ?? 0;
+    yMin = bb.yMin ?? bb.top ?? 0;
+    xMax = bb.xMax ?? (bb.left ?? 0) + (bb.width ?? 0);
+    yMax = bb.yMax ?? (bb.top ?? 0) + (bb.height ?? 0);
+  } else {
+    return null;
+  }
+
+  const cx = (xMin + xMax) * 0.5;
+  const cy = (yMin + yMax) * 0.5;
+  const w = Math.max(1, xMax - xMin);
+  return { cx, cy, w, vw, vh };
+}
+
+// 3D初期化
 async function init() {
-  const stage = document.getElementById("stage");
-  if (!stage) return;
+  const stage = requireEl("stage");
+  const uiDiv = requireEl("ui3d");
+  const webcamEl = requireEl("webcam");
 
-  const ui = document.getElementById("ui3d");
-  const webcam = document.getElementById("webcam");
+  // stage はフルスクリーン想定（room.cssが無い場合でも最低限効くように）
+  stage.style.position = stage.style.position || "fixed";
+  stage.style.inset = stage.style.inset || "0";
 
+  // UIの見た目（最低限）
+  uiDiv.style.background = uiDiv.style.background || "rgba(15, 15, 15, 0.92)";
+  uiDiv.style.color = uiDiv.style.color || "#fff";
+  uiDiv.style.borderRadius = uiDiv.style.borderRadius || "14px";
+  uiDiv.style.padding = uiDiv.style.padding || "16px";
+  uiDiv.style.width = uiDiv.style.width || "920px";
+  uiDiv.style.maxWidth = uiDiv.style.maxWidth || "92vw";
+
+  // --- WebGL scene ---
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x05070a);
+  scene.background = new THREE.Color(0x050505);
 
-  const cssScene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.1, 200);
+  const camBase = new THREE.Vector3(0, 1.65, 6.2);
+  const camTarget = camBase.clone();
+  camera.position.copy(camBase);
+  const camFocus = new THREE.Vector3(0, 1.55, 0);
+  camera.lookAt(camFocus);
 
-  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200);
-  const baseCamPos = new THREE.Vector3(0, 1.6, 7.4);
-  const camTargetPos = baseCamPos.clone();
-  camera.position.copy(baseCamPos);
-
-  const lookAt = new THREE.Vector3(0, 1.45, -2.2);
-  camera.lookAt(lookAt);
-
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.domElement.style.position = "absolute";
   renderer.domElement.style.inset = "0";
+  // UI操作を優先（必要なら後で切替）
   renderer.domElement.style.pointerEvents = "none";
   stage.appendChild(renderer.domElement);
 
+  // --- CSS3D scene ---
+  const cssScene = new THREE.Scene();
   const cssRenderer = new CSS3DRenderer();
   cssRenderer.setSize(window.innerWidth, window.innerHeight);
   cssRenderer.domElement.style.position = "absolute";
   cssRenderer.domElement.style.inset = "0";
-  cssRenderer.domElement.style.zIndex = "1";
-  cssRenderer.domElement.style.pointerEvents = "auto";
+  // CSS3DRenderer 自体はポインターを奪わず、オブジェクト要素だけ pointerEvents:auto
+  cssRenderer.domElement.style.pointerEvents = "none";
   stage.appendChild(cssRenderer.domElement);
 
-  // ---- Room (simple box) ----
-  const roomGeom = new THREE.BoxGeometry(ROOM.w, ROOM.h, ROOM.d);
-  const roomMat = new THREE.MeshStandardMaterial({ color: 0x0a0f16, side: THREE.BackSide, roughness: 1, metalness: 0 });
-  const roomMesh = new THREE.Mesh(roomGeom, roomMat);
-  roomMesh.position.set(0, ROOM.h / 2 - 0.2, 0);
-  scene.add(roomMesh);
+  // --- Lights ---
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const key = new THREE.DirectionalLight(0xffffff, 0.9);
+  key.position.set(3.5, 4.5, 2.5);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0x88aaff, 0.35);
+  rim.position.set(-4, 2.5, -3);
+  scene.add(rim);
 
+  // --- Room geometry ---
+  const roomW = 9.0;
+  const roomH = 4.8;
+  const roomD = 12.0;
+
+  const room = new THREE.Mesh(
+    new THREE.BoxGeometry(roomW, roomH, roomD),
+    new THREE.MeshStandardMaterial({ color: 0x1f1f24, roughness: 0.95, metalness: 0.0, side: THREE.BackSide })
+  );
+  room.position.set(0, roomH / 2, 0);
+  scene.add(room);
+
+  // floor accent
   const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(ROOM.w * 1.05, ROOM.d * 1.05),
-    new THREE.MeshStandardMaterial({ color: 0x070a0f, roughness: 1, metalness: 0 })
+    new THREE.PlaneGeometry(roomW, roomD),
+    new THREE.MeshStandardMaterial({ color: 0x101012, roughness: 1.0, metalness: 0.0 })
   );
   floor.rotation.x = -Math.PI / 2;
-  floor.position.y = 0;
+  floor.position.set(0, 0.001, 0);
   scene.add(floor);
 
-  const hemi = new THREE.HemisphereLight(0xaad3ff, 0x0b0c12, 0.65);
-  scene.add(hemi);
-  const key = new THREE.DirectionalLight(0xffffff, 0.9);
-  key.position.set(3, 6, 6);
-  scene.add(key);
+  // --- Back wall frame (WebGL plane) ---
+  const screenW = roomW * 0.86;
+  const screenH = roomH * 0.62;
+  const backZ = -roomD / 2 + 0.04;
 
-  // ---- UI on the back wall (CSS3D) ----
-  if (ui) {
-    const uiObj = new CSS3DObject(ui);
-    cssScene.add(uiObj);
-    uiObj.position.set(0, 1.55, -ROOM.d / 2 + 0.02);
-    uiObj.rotation.y = Math.PI;
-    uiObj.rotation.x = 0;
-    uiObj.rotation.z = 0;
+  const screenFrame = new THREE.Mesh(
+    new THREE.PlaneGeometry(screenW + 0.2, screenH + 0.2),
+    new THREE.MeshStandardMaterial({ color: 0x09090b, roughness: 0.9, metalness: 0.1 })
+  );
+  screenFrame.position.set(0, roomH * 0.56, backZ + 0.005);
+  scene.add(screenFrame);
 
-    const fitUiToWall = () => {
-      const rect = ui.getBoundingClientRect();
-      if (!rect.width || !rect.height) return;
-      const wallW = ROOM.w * 0.92;
-      const wallH = ROOM.h * 0.72;
-      const sx = wallW / rect.width;
-      const sy = wallH / rect.height;
-      const s = Math.min(sx, sy) * 0.98;
-      uiObj.scale.set(s, s, s);
-    };
-    requestAnimationFrame(fitUiToWall);
-    window.addEventListener("resize", fitUiToWall, { passive: true });
+  // --- UI as CSS3DObject (back wall) ---
+  const uiObj = new CSS3DObject(uiDiv);
+  uiObj.position.set(0, roomH * 0.56, backZ);
+  uiObj.rotation.y = 0; // 反転させると見えなくなることが多いのでまずは0
+  cssScene.add(uiObj);
+
+  function fitUI() {
+    // elementがCSS3Dに移されるタイミングによって rect が 0 になる場合があるのでガード
+    const rect = uiDiv.getBoundingClientRect();
+    const pxW = Math.max(1, rect.width);
+    const pxH = Math.max(1, rect.height);
+
+    // UIの横幅を screenW に合わせて縮尺を決める（px → world units）
+    const s = screenW / pxW;
+    uiObj.scale.set(s, s, 1);
+
+    // UIの縦をスクリーン枠に収める（縦がはみ出る場合はさらに縮める）
+    const worldH = pxH * s;
+    if (worldH > screenH) {
+      const s2 = screenH / pxH;
+      uiObj.scale.set(s2, s2, 1);
+    }
   }
 
-  // ---- Avatar (VRM or dummy) ----
-  const avatarRoot = new THREE.Group();
-  avatarRoot.position.set(0, 0, 2.45);
-  scene.add(avatarRoot);
+  // CSS3DRenderer が uiDiv を自分のDOMに移してから計測したいので2フレーム遅らせる
+  requestAnimationFrame(() => requestAnimationFrame(fitUI));
 
-  const { updateAvatar, vrm } = await loadAvatar(avatarRoot);
+  // --- Avatar (VRM) ---
+  const avatarGroup = new THREE.Group();
+  scene.add(avatarGroup);
 
-  // ---- Bus events ----
-  on("assistant:speakingStart", () => {
-    state.assistantSpeaking = true;
-  });
-  on("assistant:speakingEnd", () => {
-    state.assistantSpeaking = false;
-  });
-  on("user:micRms", ({ rms }) => {
-    state.micRms = typeof rms === "number" ? rms : 0;
-  });
-
-  // ---- Face tracking (optional; falls back automatically) ----
-  let face = null;
-  if (webcam) {
-    face = await tryStartFaceTracking(webcam, {
-      baseCamPos,
-      camTargetPos,
-    });
-  }
-
-  // ---- Render loop ----
-  const clock = new THREE.Clock();
-
-  const onResize = () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    cssRenderer.setSize(window.innerWidth, window.innerHeight);
-  };
-  window.addEventListener("resize", onResize, { passive: true });
-
-  function tick() {
-    const dt = clock.getDelta();
-    const t = clock.elapsedTime;
-
-    state.micRmsSmoothed = state.micRmsSmoothed * 0.88 + state.micRms * 0.12;
-    const userTalking = state.micRmsSmoothed > 0.055;
-    const mode = state.assistantSpeaking ? "speaking" : (userTalking ? "listening" : "idle");
-
-    if (face) face.update();
-    camera.position.lerp(camTargetPos, 0.08);
-    camera.lookAt(lookAt);
-
-    updateAvatar({ dt, t, mode, mic: state.micRmsSmoothed, vrm });
-
-    renderer.render(scene, camera);
-    cssRenderer.render(cssScene, camera);
-
-    requestAnimationFrame(tick);
-  }
-  requestAnimationFrame(tick);
-}
-
-async function loadAvatar(parent) {
-  const avatarRig = new THREE.Group();
-  parent.add(avatarRig);
-
-  const dummy = createDummyAvatar();
-  avatarRig.add(dummy);
+  // まずは必ず見えるダミーを置く（VRMロード失敗でも「3Dが動いてる」ことが分かる）
+  const dummy = new THREE.Mesh(
+    new THREE.BoxGeometry(0.6, 1.4, 0.4),
+    new THREE.MeshStandardMaterial({ color: 0x2ee59d, roughness: 0.6 })
+  );
+  dummy.position.set(0, 0.7, 2.8);
+  avatarGroup.add(dummy);
 
   let vrm = null;
-  let bones = null;
-
+  const _tmpPos = new THREE.Vector3();
+  const _tmpDir = new THREE.Vector3();
   try {
-    const { VRMLoaderPlugin, VRMUtils } = await import("https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.0.0/+esm");
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
 
     vrm = await new Promise((resolve, reject) => {
       loader.load(
         AVATAR_URL,
-        (gltf) => resolve(gltf.userData.vrm || null),
+        (gltf) => {
+          const v = gltf.userData.vrm;
+          if (!v) return reject(new Error("VRM parse failed (gltf.userData.vrm is null)"));
+          resolve(v);
+        },
         undefined,
         reject
       );
     });
 
-    if (!vrm) throw new Error("VRM plugin did not produce vrm");
+    VRMUtils.removeUnnecessaryJoints(vrm.scene);
 
-    try { VRMUtils.removeUnnecessaryVertices(vrm.scene); } catch {}
-    try { VRMUtils.removeUnnecessaryJoints(vrm.scene); } catch {}
-    try { VRMUtils.rotateVRM0(vrm); } catch {}
+    // ダミーを消してVRMを置く
+    avatarGroup.remove(dummy);
 
-    dummy.visible = false;
-    avatarRig.add(vrm.scene);
-    vrm.scene.position.set(0, 0, 0);
-    vrm.scene.rotation.y = Math.PI;
+    // NOTE: VRM/VRoid系は「モデルの正面方向」が環境によって +Z / -Z どちらのこともあります。
+    // ここでは「こちら（カメラ）を向いていない」問題を解消するため、まず 0 をデフォルトにします。
+    // もし逆向きになった場合は、次の1行を Math.PI に戻してください。
+    vrm.scene.rotation.y = 0;
+    vrm.scene.position.set(0, 0, 2.8);
+
+    // ちょいスケール調整（モデルによっては大き過ぎ/小さ過ぎる）
     vrm.scene.scale.setScalar(1.0);
 
-    bones = captureVrmBones(vrm);
-    safeLog("VRM loaded:", AVATAR_URL);
+    avatarGroup.add(vrm.scene);
+
+    console.info("[room] VRM loaded:", AVATAR_URL);
   } catch (e) {
-    safeLog("VRM not available, using dummy:", e?.message || e);
+    console.warn("[room] VRM load failed (fallback to dummy):", e);
+    debug.append("VRM load failed. Using dummy avatar.\n" + String(e));
   }
 
-  const updateAvatar = ({ dt, t, mode, mic, vrm }) => {
-    if (vrm) vrm.update(dt);
-    animateAvatar({ t, mode, mic, dummy, vrm, bones, rig: avatarRig });
-  };
-
-  return { updateAvatar, vrm };
-}
-
-function createDummyAvatar() {
-  const group = new THREE.Group();
-  group.position.set(0, 0, 0);
-
-  const body = new THREE.Mesh(
-    new THREE.SphereGeometry(0.42, 32, 24),
-    new THREE.MeshStandardMaterial({ color: 0x38e5b6, roughness: 0.35, metalness: 0.05 })
-  );
-  body.position.y = 1.05;
-  group.add(body);
-
-  const face = new THREE.Mesh(
-    new THREE.SphereGeometry(0.28, 28, 20),
-    new THREE.MeshStandardMaterial({ color: 0x7ff3d3, roughness: 0.45, metalness: 0.02 })
-  );
-  face.position.y = 1.6;
-  face.position.z = 0.08;
-  group.add(face);
-
-  const armL = new THREE.Mesh(
-    new THREE.CapsuleGeometry(0.07, 0.52, 8, 18),
-    new THREE.MeshStandardMaterial({ color: 0x2bcaa2, roughness: 0.35, metalness: 0.05 })
-  );
-  armL.position.set(-0.42, 1.12, 0.05);
-  armL.rotation.z = 0.9;
-  group.add(armL);
-
-  const armR = armL.clone();
-  armR.position.x = 0.42;
-  armR.rotation.z = -0.9;
-  group.add(armR);
-
-  group.userData = { body, face, armL, armR };
-  return group;
-}
-
-function captureVrmBones(vrm) {
-  const get = (name) => {
-    try { return vrm.humanoid?.getNormalizedBoneNode(name) || null; } catch { return null; }
-  };
-  const nodes = {
-    head: get("head"),
-    neck: get("neck"),
-    chest: get("chest"),
-    spine: get("spine"),
-    leftUpperArm: get("leftUpperArm"),
-    rightUpperArm: get("rightUpperArm"),
-  };
-
-  const base = {};
-  for (const [k, node] of Object.entries(nodes)) {
-    if (node) base[k] = node.quaternion.clone();
-  }
-  return { nodes, base };
-}
-
-function animateAvatar({ t, mode, mic, dummy, vrm, bones, rig }) {
-  const breath = Math.sin(t * 1.2) * 0.03;
-  const sway = Math.sin(t * 0.7) * 0.12;
-
-  let nod = 0;
-  let talk = 0;
-  let wave = 0;
-
-  if (mode === "idle") {
-    nod = Math.sin(t * 1.4) * 0.05;
-    talk = 0;
-    wave = 0;
-  } else if (mode === "listening") {
-    nod = Math.sin(t * 3.0) * 0.18 + clamp(mic * 0.9, 0, 0.22);
-    talk = 0;
-    wave = 0.1 + Math.sin(t * 1.1) * 0.08;
-  } else if (mode === "speaking") {
-    nod = Math.sin(t * 4.2) * 0.11;
-    talk = 0.2 + Math.sin(t * 6.0) * 0.25;
-    wave = 0.45 + Math.sin(t * 2.7) * 0.25;
+  // カメラの方向へアバターのY軸だけ向ける（必要なら無効化可能）
+  function updateAvatarFacing() {
+    if (!vrm || !AVATAR_FACE_VIEWER) return;
+    vrm.scene.getWorldPosition(_tmpPos);
+    _tmpDir.subVectors(camera.position, _tmpPos);
+    _tmpDir.y = 0;
+    if (_tmpDir.lengthSq() < 1e-6) return;
+    const desiredYaw = Math.atan2(_tmpDir.x, _tmpDir.z) + AVATAR_YAW_OFFSET;
+    vrm.scene.rotation.y = lerpAngle(vrm.scene.rotation.y, desiredYaw, 0.12);
   }
 
-  rig.position.y = 0 + breath * (mode === "speaking" ? 1.3 : 1.0);
-  rig.rotation.y = sway * (mode === "speaking" ? 1.2 : 0.8);
+  // --- Face tracking (optional) ---
+  initFaceTracking(webcamEl);
 
-  if (dummy?.visible) {
-    const { body, face, armL, armR } = dummy.userData || {};
-    if (body) body.position.y = 1.05 + breath * 0.8;
-    if (face) face.rotation.x = -nod;
-    if (armL) armL.rotation.x = -wave;
-    if (armR) armR.rotation.x = -wave;
-    return;
+  // --- Animation loop ---
+  const clock = new THREE.Clock();
+
+  function applyAvatarMotion(t, dt) {
+    // ざっくり状態
+    const speak = assistantSpeaking ? 1 : 0;
+    const listen = Math.min(1, micRms * 10);
+
+    // ダミー用（VRMがない時）
+    if (!vrm) {
+      dummy.position.y = 0.7 + 0.05 * listen + 0.04 * speak * Math.sin(t * 16);
+      dummy.rotation.y = 0.15 * Math.sin(t * 0.8);
+      return;
+    }
+
+    // VRMボーンで軽い身振り手振り
+    const head = vrm.humanoid?.getNormalizedBoneNode("head");
+    const jaw = vrm.humanoid?.getNormalizedBoneNode("jaw");
+    const lArm = vrm.humanoid?.getNormalizedBoneNode("leftUpperArm");
+    const rArm = vrm.humanoid?.getNormalizedBoneNode("rightUpperArm");
+
+    if (head) {
+      head.rotation.x = -0.10 * listen + 0.04 * speak * Math.sin(t * 10);
+      head.rotation.y = 0.08 * Math.sin(t * 0.6);
+    }
+
+    // 口パク（超簡易）：喋ってる間だけ顎を動かす
+    if (jaw) {
+      const mouth = speak * (0.25 + 0.15 * Math.sin(t * 22));
+      jaw.rotation.x = -mouth;
+    }
+
+    if (lArm) lArm.rotation.z = 0.35 * speak * Math.sin(t * 5.5);
+    if (rArm) rArm.rotation.z = -0.35 * speak * Math.sin(t * 5.5);
+
+    // VRM内部更新
+    vrm.update(dt);
   }
 
-  if (!vrm || !bones) return;
-  const { nodes, base } = bones;
-
-  const apply = (key, euler) => {
-    const node = nodes[key];
-    if (!node || !base[key]) return;
-    node.quaternion.copy(base[key]);
-    const q = new THREE.Quaternion().setFromEuler(euler);
-    node.quaternion.multiply(q);
-  };
-
-  apply("spine", new THREE.Euler(-nod * 0.22, 0, 0));
-  apply("chest", new THREE.Euler(-nod * 0.35, 0, 0));
-  apply("neck", new THREE.Euler(-nod * 0.45, 0, 0));
-  apply("head", new THREE.Euler(-nod * 0.85, Math.sin(t * 0.8) * 0.08, 0));
-
-  apply("leftUpperArm", new THREE.Euler(-wave * 0.7, 0, 0.38 + talk * 0.08));
-  apply("rightUpperArm", new THREE.Euler(-wave * 0.7, 0, -0.38 - talk * 0.08));
-}
-
-async function tryStartFaceTracking(video, { baseCamPos, camTargetPos }) {
-  if (!navigator.mediaDevices?.getUserMedia) return null;
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
-    video.srcObject = stream;
-    await video.play().catch(() => {});
-  } catch (e) {
-    safeLog("face tracking: getUserMedia rejected:", e?.message || e);
-    return null;
-  }
-
-  const fld = window.faceLandmarksDetection;
-  if (!fld?.createDetector) {
-    safeLog("face tracking: face-landmarks-detection not loaded; fixed camera");
-    return null;
-  }
-
-  let detector = null;
-  try {
-    const model = fld.SupportedModels?.MediaPipeFaceMesh || "MediaPipeFaceMesh";
-    detector = await fld.createDetector(model, {
-      runtime: "mediapipe",
-      maxFaces: 1,
-      refineLandmarks: false,
-      solutionPath: "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh",
-    });
-  } catch (e) {
-    safeLog("face tracking: detector init failed:", e?.message || e);
-    return null;
-  }
-
-  const target = baseCamPos.clone();
-  let last = 0;
-  let hasFace = false;
-  let running = false;
-
-  const update = async () => {
+  async function updateCameraByFace() {
     const now = performance.now();
-    if (running) return;
-    if (now - last < 120) return;
-    last = now;
-    running = true;
+    if (now - faceLastMs < FACE_SAMPLE_INTERVAL_MS) return;
+    if (faceInFlight) return;
+    faceLastMs = now;
+    faceInFlight = true;
 
-    let faces = [];
     try {
-      faces = await detector.estimateFaces(video, { flipHorizontal: true });
-    } catch {
-      running = false;
-      return;
+      const sample = await sampleFaceBox();
+      if (!sample) return;
+
+      const { cx, cy, w, vw, vh } = sample;
+
+      // trompeloeil の式に寄せて「角度→カメラ位置」を計算する
+      const kx = (2 * (cx - vw / 2)) / vw;
+      const ky = (2 * (cy - vh / 2)) / vh;
+
+      const hfov = faceFov?.hfov ?? THREE.MathUtils.degToRad(50);
+      const vfov = faceFov?.vfov ?? THREE.MathUtils.degToRad(35);
+
+      const ax = Math.atan(kx * Math.tan(hfov / 2));
+      const ay = Math.atan(ky * Math.tan(vfov / 2));
+
+      // 目安として ±30deg までに制限（画面外に大きく出た時の暴れ防止）
+      const axC = THREE.MathUtils.clamp(ax, -0.52, 0.52);
+      const ayC = THREE.MathUtils.clamp(ay, -0.52, 0.52);
+
+      const tan1 = -Math.tan(axC);
+      const tan2 = -Math.tan(ayC);
+
+      // 距離は一定（PDFでも「距離推定はノイズが多いので固定」が説明されている）
+      const d = camBase.z - camFocus.z;
+      const z = Math.sqrt((d * d) / (1 + tan1 * tan1 + tan2 * tan2));
+
+      // 顔サイズは「検出できているか」程度にのみ使用（急な跳ねの抑制）
+      const faceOk = w > 20;
+      const strength = faceOk ? 1 : 0.4;
+
+      camTarget.set(
+        camFocus.x + z * tan1 * strength,
+        camFocus.y + (camBase.y - camFocus.y) + z * tan2 * strength,
+        camFocus.z + z
+      );
+    } finally {
+      faceInFlight = false;
     }
-    running = false;
-    if (!faces?.length) {
-      hasFace = false;
-      target.copy(baseCamPos);
-      camTargetPos.copy(target);
-      return;
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = clock.getDelta();
+    const t = clock.elapsedTime;
+
+    // アバター
+    applyAvatarMotion(t, dt);
+
+    // 顔追従カメラ（任意）
+    if (faceDetector) {
+      // 非同期（重いので await しない）
+      updateCameraByFace().catch(() => {});
     }
-    hasFace = true;
 
-    const { cx, cy, w } = faceBoxFromEstimate(faces[0], video.videoWidth || 640, video.videoHeight || 480);
-    const dx = (cx - 0.5);
-    const dy = (cy - 0.5);
+    // なめらかに追従
+    camera.position.lerp(camTarget, 0.12);
+    camera.lookAt(camFocus);
 
-    const offsetX = clamp(-dx * 0.85, -0.6, 0.6);
-    const offsetY = clamp(-dy * 0.45, -0.35, 0.35);
-    const offsetZ = clamp((0.22 - w) * 3.2, -0.55, 0.55);
+    // アバターをこちらへ向ける（視点移動時も追従）
+    updateAvatarFacing();
 
-    target.set(baseCamPos.x + offsetX, baseCamPos.y + offsetY, baseCamPos.z + offsetZ);
-    camTargetPos.lerp(target, 0.35);
-  };
+    renderer.render(scene, camera);
+    cssRenderer.render(cssScene, camera);
+  }
 
-  // Wrap async update to avoid unhandled rejections inside RAF loop
-  const safeUpdate = () => { update().catch(() => {}); };
+  function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    cssRenderer.setSize(window.innerWidth, window.innerHeight);
+    fitUI();
+  }
 
-  safeLog("face tracking: active", hasFace ? "(face detected)" : "");
-  return { update: safeUpdate };
+  window.addEventListener("resize", onResize);
+
+  animate();
 }
 
-function faceBoxFromEstimate(face, vw, vh) {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-
-  const b = face?.box;
-  if (b && typeof b === "object") {
-    const xMin = b.xMin ?? b.left ?? b.x ?? b[0];
-    const yMin = b.yMin ?? b.top ?? b.y ?? b[1];
-    const xMax = b.xMax ?? b.right ?? ((typeof xMin === "number" && typeof b.width === "number") ? (xMin + b.width) : undefined);
-    const yMax = b.yMax ?? b.bottom ?? ((typeof yMin === "number" && typeof b.height === "number") ? (yMin + b.height) : undefined);
-    if ([xMin, yMin, xMax, yMax].every((v) => typeof v === "number")) {
-      minX = xMin; minY = yMin; maxX = xMax; maxY = yMax;
-    }
-  }
-
-  if (!Number.isFinite(minX) && Array.isArray(face?.keypoints)) {
-    for (const kp of face.keypoints) {
-      const x = kp.x ?? kp[0];
-      const y = kp.y ?? kp[1];
-      if (typeof x !== "number" || typeof y !== "number") continue;
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
-    }
-  }
-
-  if (!Number.isFinite(minX)) {
-    minX = vw * 0.35; maxX = vw * 0.65;
-    minY = vh * 0.25; maxY = vh * 0.75;
-  }
-
-  const cx = ((minX + maxX) / 2) / Math.max(vw, 1);
-  const cy = ((minY + maxY) / 2) / Math.max(vh, 1);
-  const w = (maxX - minX) / Math.max(vw, 1);
-  return { cx, cy, w };
+// 初期化タイミング：DOM構築後
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => {
+    init().catch((e) => {
+      console.error("[room] init failed:", e);
+      debug.show("room.js init failed:\n" + String(e));
+    });
+  });
+} else {
+  init().catch((e) => {
+    console.error("[room] init failed:", e);
+    debug.show("room.js init failed:\n" + String(e));
+  });
 }
