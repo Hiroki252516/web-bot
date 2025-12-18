@@ -17,6 +17,13 @@ import { on } from "./bus.js";
 
 const AVATAR_URL = "./assets/zundamon.vrm"; // ここに配置したVRMを読みます
 
+// アバターが常にこちら（カメラ）を向くようにするか。
+// ※「固定向きが良い」なら false にしてください。
+const AVATAR_FACE_VIEWER = true;
+
+// モデルの「正面」が +Z ではなく -Z の場合は Math.PI にすると合うことが多いです。
+const AVATAR_YAW_OFFSET = 0;
+
 // --- ちょっとしたデバッグ表示（致命的エラー時のみ） ---
 const debug = (() => {
   const el = document.createElement("pre");
@@ -57,6 +64,15 @@ function requireEl(id) {
   return el;
 }
 
+function lerpAngle(a, b, t) {
+  // shortest-path lerp for radians
+  const TWO_PI = Math.PI * 2;
+  let d = (b - a) % TWO_PI;
+  if (d < -Math.PI) d += TWO_PI;
+  else if (d > Math.PI) d -= TWO_PI;
+  return a + d * t;
+}
+
 // 状態（busイベント）
 let assistantSpeaking = false;
 let micRms = 0;
@@ -74,13 +90,49 @@ let detector = null;
 let faceVideo = null;
 let faceLastMs = 0;
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForGlobals({ timeoutMs = 8000 } = {}) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    if (window.tf && window.faceLandmarksDetection) return true;
+    await sleep(50);
+  }
+  return false;
+}
+
 async function tryInitFaceTracking(webcamEl) {
-  // index.html で tfjs と face-landmarks-detection を読み込んでいない場合はスキップ
+  // NOTE:
+  // - index.html では <script defer ...> で tfjs / face-landmarks-detection を読み込んでいるため、
+  //   room.js の初期化タイミング次第では window.tf / window.faceLandmarksDetection がまだ未定義のことがあります。
+  // - その場合、ここで即returnすると永遠にパララックスが無効化されるので、少し待ってから初期化します。
+  // - それでも無ければ ESM を動的importして復旧を試みます。
+
+  if (!window.tf || !window.faceLandmarksDetection) {
+    await waitForGlobals({ timeoutMs: 8000 });
+  }
+
   const tf = window.tf;
-  const fld = window.faceLandmarksDetection;
-  if (!tf || !fld) {
-    console.info("[room] Face tracking disabled (tfjs / face-landmarks-detection not loaded)");
+  let fld = window.faceLandmarksDetection;
+
+  if (!tf) {
+    console.info("[room] Face tracking disabled (tfjs not loaded)");
     return;
+  }
+
+  if (!fld?.createDetector) {
+    try {
+      // UMDが読み込めていない環境向けの保険（CDNのESMビルド）
+      fld = await import(
+        "https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.5/dist/face-landmarks-detection.esm.js"
+      );
+      window.faceLandmarksDetection = fld;
+    } catch (e) {
+      console.info("[room] Face tracking disabled (face-landmarks-detection not loaded)");
+      return;
+    }
   }
 
   try {
@@ -92,10 +144,13 @@ async function tryInitFaceTracking(webcamEl) {
     await webcamEl.play();
     faceVideo = webcamEl;
 
-    await tf.setBackend("webgl");
+    // できるだけ滑らかにするため WebGL backend を優先（失敗してもデフォルトで続行）
+    try {
+      await tf.setBackend("webgl");
+    } catch {}
     await tf.ready();
 
-    const model = fld.SupportedModels.MediaPipeFaceMesh;
+    const model = fld.SupportedModels?.MediaPipeFaceMesh || fld.SupportedModels?.MediaPipeFaceMesh;
     detector = await fld.createDetector(model, {
       runtime: "tfjs",
       refineLandmarks: false,
@@ -262,6 +317,8 @@ async function init() {
   avatarGroup.add(dummy);
 
   let vrm = null;
+  const _tmpPos = new THREE.Vector3();
+  const _tmpDir = new THREE.Vector3();
   try {
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -284,8 +341,10 @@ async function init() {
     // ダミーを消してVRMを置く
     avatarGroup.remove(dummy);
 
-    // VRMは多くが -Z 向きなので、カメラ(+Z)に向くように回す
-    vrm.scene.rotation.y = Math.PI;
+    // NOTE: VRM/VRoid系は「モデルの正面方向」が環境によって +Z / -Z どちらのこともあります。
+    // ここでは「こちら（カメラ）を向いていない」問題を解消するため、まず 0 をデフォルトにします。
+    // もし逆向きになった場合は、次の1行を Math.PI に戻してください。
+    vrm.scene.rotation.y = 0;
     vrm.scene.position.set(0, 0, 2.8);
 
     // ちょいスケール調整（モデルによっては大き過ぎ/小さ過ぎる）
@@ -297,6 +356,17 @@ async function init() {
   } catch (e) {
     console.warn("[room] VRM load failed (fallback to dummy):", e);
     debug.append("VRM load failed. Using dummy avatar.\n" + String(e));
+  }
+
+  // カメラの方向へアバターのY軸だけ向ける（必要なら無効化可能）
+  function updateAvatarFacing() {
+    if (!vrm || !AVATAR_FACE_VIEWER) return;
+    vrm.scene.getWorldPosition(_tmpPos);
+    _tmpDir.subVectors(camera.position, _tmpPos);
+    _tmpDir.y = 0;
+    if (_tmpDir.lengthSq() < 1e-6) return;
+    const desiredYaw = Math.atan2(_tmpDir.x, _tmpDir.z) + AVATAR_YAW_OFFSET;
+    vrm.scene.rotation.y = lerpAngle(vrm.scene.rotation.y, desiredYaw, 0.12);
   }
 
   // --- Face tracking (optional) ---
@@ -384,6 +454,9 @@ async function init() {
     // なめらかに追従
     camera.position.lerp(camTarget, 0.12);
     camera.lookAt(0, 1.55, 0);
+
+    // アバターをこちらへ向ける（視点移動時も追従）
+    updateAvatarFacing();
 
     renderer.render(scene, camera);
     cssRenderer.render(cssScene, camera);
