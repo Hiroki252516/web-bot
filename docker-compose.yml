@@ -37,7 +37,7 @@ services:
       GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-2.0-flash}
       DATABASE_URL: postgresql://webbot:webbot@db:5432/webbot
       SESSION_SECRET: ${SESSION_SECRET:-dev-secret-change-me}
-      CODEX_HOME: /app-codex/.codex
+      CODEX_HOME: /root/.codex
       # ★ VOICEVOX コンテナをサービス名で参照
       VOICEVOX_URL: http://voicevox:50021
     # Linux 環境でも host.docker.internal を使えるようにする
@@ -52,7 +52,7 @@ services:
       - "8001:8000"
     volumes:
       - .:/app
-      - ${HOME}/web-bot-codex/.codex:/app-codex/.codex
+      - ${HOME}/.codex:/root/.codex
 
 volumes:
   db-data:
